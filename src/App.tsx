@@ -130,6 +130,10 @@ class Voice {
     if (!repeat) this.finished = true;
   }
 
+  get context() {
+    return this.ctx;
+  }
+
   /** True once a non-looping track has played to its end. */
   isDone() {
     return this.started && this.finished && this.live.size === 0;
@@ -209,6 +213,9 @@ const idOf = (f: File) => {
   return id;
 };
 const sig = (f: File) => `${f.name}|${f.size}|${f.lastModified}`;
+const dbg = (...a: unknown[]) => console.log("[player]", ...a); // diagnostics for track switching
+const why = (e: unknown) =>
+  e instanceof Error ? (e.name === "Error" ? e.message : `${e.name}: ${e.message}`) : String(e);
 const title = (f: File) => f.name.replace(/\.[^.]+$/, "");
 const fmt = (s: number) => {
   const r = Math.floor(s % 60);
@@ -237,6 +244,7 @@ body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,sans-
 .layout{display:grid;grid-template-columns:minmax(0,420px) minmax(0,1fr);gap:32px;align-items:start}
 .panel{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:24px 20px}
 .title{font-size:20px;font-weight:600;margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-height:28px}
+.sub.error{color:#d6453d}
 .sub{margin:4px 0 20px;color:var(--muted);font-size:14px;min-height:20px}
 .seek{display:grid;grid-template-columns:auto 1fr auto;gap:12px;align-items:center;font-size:13px;color:var(--muted);font-variant-numeric:tabular-nums}
 .transport{display:flex;justify-content:center;align-items:center;gap:16px;margin:20px 0 24px}
@@ -305,6 +313,8 @@ export default function App() {
   const [tracks, setTracks] = useState<File[]>([]);
   const [index, setIndex] = useState(0);
   const [playing, setPlaying] = useState(false);
+  const [nowPlaying, setNowPlaying] = useState<File | null>(null); // the track actually sounding
+  const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [fade, setFade] = useStored<number>("fade", 4, [0, 12]);
   const [loopFade, setLoopFade] = useStored<number>("loopFade", 3, [0, 12]);
@@ -345,6 +355,9 @@ export default function App() {
   alphaRef.current = alpha;
   const addedRef = useRef<File[]>([]); // files in the order they were added
   const advancing = useRef(false);
+  const loadingRef = useRef(false); // a user-requested switch is in progress
+  const nowRef = useRef<File | null>(null); // the track actually playing
+  const staleCtx = useRef<AudioContext | null>(null); // replaced context still used by the fading-out track
 
   const getCtx = () => {
     if (!ctxRef.current) {
@@ -358,10 +371,45 @@ export default function App() {
     return ctxRef.current;
   };
 
+  // Abandon a misbehaving AudioContext; the playing track keeps using it until it fades out.
+  const resetCtx = () => {
+    dbg("rebuilding the audio context");
+    staleCtx.current ??= ctxRef.current;
+    ctxRef.current = null;
+    outRef.current = null;
+  };
+
+  // Read + decode a file. Failures are retried once, rebuilding the audio context for decode errors.
+  const decodeFile = async (file: File): Promise<AudioBuffer> => {
+    let bytes: ArrayBuffer;
+    try {
+      bytes = await file.arrayBuffer();
+    } catch {
+      await new Promise((r) => setTimeout(r, 200));
+      try {
+        bytes = await file.arrayBuffer();
+      } catch (e) {
+        throw new Error(`couldn’t read the file (${why(e)})`);
+      }
+    }
+    try {
+      return await getCtx().decodeAudioData(bytes.slice(0)); // slice: decoding detaches its input
+    } catch (e) {
+      dbg("decode failed; retrying with a fresh audio context", file.name, why(e));
+      for (const f of [...cache.current.keys()]) if (f !== file && f !== nowRef.current) cache.current.delete(f);
+      resetCtx();
+      try {
+        return await getCtx().decodeAudioData(bytes.slice(0));
+      } catch (e2) {
+        throw new Error(`couldn’t decode the file (${why(e2)})`);
+      }
+    }
+  };
+
   const load = (file: File) => {
     let p = cache.current.get(file);
     if (!p) {
-      p = file.arrayBuffer().then((ab) => getCtx().decodeAudioData(ab));
+      p = decodeFile(file);
       cache.current.set(file, p);
       p.catch(() => cache.current.delete(file));
     }
@@ -372,42 +420,70 @@ export default function App() {
     const list = tracksRef.current;
     if (!list.length) return;
     const i = (target + list.length) % list.length;
-    const ctx = getCtx();
     const f = fadeOverride ?? fadeRef.current;
     const my = ++token.current;
+    loadingRef.current = true;
+    dbg("switch requested", { to: list[i].name, attempt: my, fade: f });
     setIndex(i);
     setBusy(true);
     try {
       const buf = await load(list[i]);
-      if (my !== token.current) return; // a newer click superseded this one
+      dbg("decoded", { attempt: my, seconds: Math.round(buf.duration) });
+      if (my !== token.current) {
+        dbg("abandoned: a newer request replaced attempt", my, "with", token.current);
+        return;
+      }
+      const ctx = getCtx(); // fetched after loading, in case the context was rebuilt
       const [lo, hi] = audibleRange(buf, 10 ** (silenceRef.current / 20)); // dB -> amplitude
       const track: Loaded = { buf, lo, hi };
       if (ctx.state === "suspended") await ctx.resume();
       const old = voiceRef.current;
-      old?.fadeOut(f);
-      voiceRef.current = new Voice(
+      // Build the new voice first, so a failure can't leave the old one half-faded out.
+      const voice = new Voice(
         ctx,
         track,
         () => ({ loop: loopFadeRef.current, level: crossRef.current / 100, repeat: repeatRef.current }),
         outRef.current!,
         old ? Math.max(f, 0.03) : 0.3
       );
+      old?.fadeOut(f);
+      voiceRef.current = voice;
+      const stale = staleCtx.current;
+      if (stale) {
+        staleCtx.current = null; // close the abandoned context once the old track has faded out
+        window.setTimeout(() => stale.close().catch(() => {}), f * 1000 + 1500);
+      }
+      dbg("now playing", { attempt: my, name: list[i].name });
       setPlaying(true);
 
-      // Keep only the current and next track decoded; preload the next one.
+      setNowPlaying(list[i]);
+      nowRef.current = list[i];
+      setError(null);
+
+      // Keep the previous, current and next tracks decoded so Next/Previous are instant.
       const next = list[(i + 1) % list.length];
-      const keep = new Set([list[i], next]);
+      const prev = list[(i - 1 + list.length) % list.length];
+      const keep = new Set([list[i], next, prev]);
       for (const f of [...cache.current.keys()]) if (!keep.has(f)) cache.current.delete(f);
-      load(next).catch(() => {});
+      load(next)
+        .catch(() => {})
+        .then(() => load(prev))
+        .catch(() => {});
     } catch (e) {
       console.error("Could not play", list[i]?.name, e);
+      if (my === token.current && list[i]) {
+        setError(`Couldn’t play “${title(list[i])}” – ${why(e)}.`);
+      }
     } finally {
-      if (my === token.current) setBusy(false);
+      if (my === token.current) {
+        setBusy(false);
+        loadingRef.current = false;
+      }
     }
   };
 
   const toggle = async () => {
-    const ctx = ctxRef.current;
+    const ctx = voiceRef.current?.context ?? ctxRef.current;
     if (!voiceRef.current || !ctx) return go(indexRef.current);
     if (ctx.state === "running") {
       await ctx.suspend();
@@ -490,14 +566,16 @@ export default function App() {
       setDur(v ? v.duration : 0);
 
       // With looping off, crossfade into the next track as this one nears its end.
-      if (v && !repeatRef.current && !advancing.current && ctxRef.current?.state === "running") {
+      if (v && !repeatRef.current && !advancing.current && !loadingRef.current && v.context.state === "running") {
         const done = v.isDone(); // fallback if the poll missed the end (e.g. throttled tab)
         const left = done ? 0 : v.duration - v.position();
         // Never fade for longer than half the track; keep a small lead even at 0 so the hand-off is seamless.
         const lead = Math.max(Math.min(fadeRef.current, v.duration / 2), 0.25);
         if (done || left <= lead) {
           advancing.current = true;
-          go(indexRef.current + 1, Math.max(0.1, left - 0.1)).finally(() => {
+          // Advance from the track that is really playing, not from whatever was last clicked.
+          const at = nowRef.current ? tracksRef.current.indexOf(nowRef.current) : indexRef.current;
+          go(at + 1, Math.max(0.1, left - 0.1)).finally(() => {
             window.setTimeout(() => (advancing.current = false), 2000);
           });
         }
@@ -514,6 +592,7 @@ export default function App() {
   }, [volume]);
 
   const current = tracks[index];
+  const shownTrack = nowPlaying ?? current; // what's really playing, not just what was clicked
   const shown = scrub ?? pos;
 
   return (
@@ -523,9 +602,15 @@ export default function App() {
        <div className="layout">
         <div>
         <section className="panel">
-          <h1 className="title">{current ? title(current) : "No track loaded"}</h1>
-          <p className="sub">
-            {busy ? "Loading…" : tracks.length ? `Track ${index + 1} of ${tracks.length}` : "Add some audio files to start"}
+          <h1 className="title">{shownTrack ? title(shownTrack) : "No track loaded"}</h1>
+          <p className={`sub${error && !busy ? " error" : ""}`}>
+            {busy
+              ? `Loading “${current ? title(current) : ""}”…`
+              : error
+                ? error
+                : shownTrack
+                  ? `Track ${tracks.indexOf(shownTrack) + 1} of ${tracks.length}`
+                  : "Add some audio files to start"}
           </p>
 
           <div className="seek">
@@ -614,8 +699,9 @@ export default function App() {
         <ol className="list">
           {tracks.map((f, i) => (
             <li key={idOf(f)}>
-              <button className="item" aria-current={i === index} onClick={() => go(i)}>
+              <button className="item" aria-current={f === shownTrack} onClick={() => go(i)}>
                 {title(f)}
+                {busy && i === index && f !== shownTrack ? " …" : ""}
               </button>
             </li>
           ))}
