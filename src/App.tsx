@@ -281,6 +281,69 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;heigh
 input[type=range]::-moz-range-thumb{width:14px;height:14px;border:0;border-radius:50%;background:var(--accent)}
 `;
 
+/**
+ * A twenty-second WAV that is practically inaudible (peaks of 24 out of 32767, about -63 dB).
+ * Browsers only hook up media keys for real media elements, and Firefox only counts an element as
+ * audible (and so controllable) if it is louder than about -72 dB.
+ */
+// Peak level of the helper tone, in 16-bit units (24 is about -63 dB). Firefox only treats it as audible above
+// roughly 9 (-72 dB), and testing showed it working reliably from about 10 up. Can be overridden for testing with
+// localStorage.setItem("crossfade-player:anchorLevel", "300") followed by a reload.
+const anchorLevel = () => {
+  try {
+    const v = Number(localStorage.getItem("crossfade-player:anchorLevel"));
+    if (Number.isFinite(v) && v >= 1 && v <= 3000) return v;
+  } catch {
+    /* storage unavailable */
+  }
+  return 24;
+};
+
+const silentWavUrl = () => {
+  const level = anchorLevel();
+  const rate = 8000;
+  const n = rate * 20; // long enough not to be mistaken for a short sound effect
+  const buf = new ArrayBuffer(44 + n * 2);
+  const v = new DataView(buf);
+  const str = (o: number, t: string) => [...t].forEach((c, i) => v.setUint8(o + i, c.charCodeAt(0)));
+  str(0, "RIFF");
+  v.setUint32(4, 36 + n * 2, true);
+  str(8, "WAVEfmt ");
+  v.setUint32(16, 16, true);
+  v.setUint16(20, 1, true); // PCM
+  v.setUint16(22, 1, true); // mono
+  v.setUint32(24, rate, true);
+  v.setUint32(28, rate * 2, true);
+  v.setUint16(32, 2, true);
+  v.setUint16(34, 16, true);
+  str(36, "data");
+  v.setUint32(40, n * 2, true);
+  for (let i = 0; i < n; i++) v.setInt16(44 + i * 2, Math.round(level * Math.sin((2 * Math.PI * 100 * i) / rate)), true);
+  // A data: URL (rather than a blob: URL) can't be revoked or expire while the browser is still loading it.
+  const bytes = new Uint8Array(buf);
+  let bin = "";
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return "data:audio/wav;base64," + btoa(bin);
+};
+
+/**
+ * Fallback anchor that needs no audio file: a quiet oscillator (about -64 dB) in its own
+ * AudioContext, streamed into an <audio> element.
+ */
+const streamAnchor = () => {
+  const ctx = new AudioContext();
+  const osc = ctx.createOscillator();
+  osc.frequency.value = 100;
+  const gain = ctx.createGain();
+  gain.gain.value = 0.0006;
+  const dest = ctx.createMediaStreamDestination();
+  osc.connect(gain).connect(dest);
+  osc.start();
+  const a = new Audio();
+  a.srcObject = dest.stream;
+  return { a, ctx };
+};
+
 /** Like useState, but remembered in localStorage (and range-checked when loaded). */
 function useStored<T extends number | boolean>(key: string, initial: T, range?: [number, number]) {
   const name = "crossfade-player:" + key;
@@ -357,7 +420,14 @@ export default function App() {
   const advancing = useRef(false);
   const loadingRef = useRef(false); // a user-requested switch is in progress
   const nowRef = useRef<File | null>(null); // the track actually playing
+  const anchorCtxRef = useRef<AudioContext | null>(null); // only used by the stream-based fallback anchor
+  const anchorRef = useRef<HTMLAudioElement | null>(null); // near-silent element that enables media keys
   const staleCtx = useRef<AudioContext | null>(null); // replaced context still used by the fading-out track
+
+  const startAnchor = () => {
+    void anchorCtxRef.current?.resume();
+    return anchorRef.current?.play();
+  };
 
   const getCtx = () => {
     if (!ctxRef.current) {
@@ -423,6 +493,11 @@ export default function App() {
     const f = fadeOverride ?? fadeRef.current;
     const my = ++token.current;
     loadingRef.current = true;
+    // Start the anchor element right away, while the click still counts as a user gesture (autoplay rules).
+    startAnchor()?.then(
+      () => dbg("media-key anchor is playing"),
+      (e) => dbg("media-key anchor was blocked:", why(e))
+    );
     dbg("switch requested", { to: list[i].name, attempt: my, fade: f });
     setIndex(i);
     setBusy(true);
@@ -471,6 +546,7 @@ export default function App() {
         .catch(() => {});
     } catch (e) {
       console.error("Could not play", list[i]?.name, e);
+      if (!voiceRef.current) anchorRef.current?.pause();
       if (my === token.current && list[i]) {
         setError(`Couldn’t play “${title(list[i])}” – ${why(e)}.`);
       }
@@ -482,16 +558,26 @@ export default function App() {
     }
   };
 
-  const toggle = async () => {
+  const nowIndex = () => (nowRef.current ? tracksRef.current.indexOf(nowRef.current) : indexRef.current);
+
+  const setPaused = async (pause: boolean) => {
     const ctx = voiceRef.current?.context ?? ctxRef.current;
-    if (!voiceRef.current || !ctx) return go(indexRef.current);
-    if (ctx.state === "running") {
+    if (!voiceRef.current || !ctx) {
+      if (!pause) await go(indexRef.current);
+      return;
+    }
+    if (pause && ctx.state === "running") {
       await ctx.suspend();
       setPlaying(false);
-    } else {
+    } else if (!pause && ctx.state !== "running") {
       await ctx.resume();
       setPlaying(true);
     }
+  };
+
+  const toggle = () => {
+    const ctx = voiceRef.current?.context ?? ctxRef.current;
+    return setPaused(ctx?.state === "running");
   };
 
   const commitSeek = () => {
@@ -583,6 +669,86 @@ export default function App() {
     }, 100);
     return () => window.clearInterval(id);
   }, []);
+
+  // Media keys / lock-screen controls. A looping, practically silent <audio> element anchors the session.
+  useEffect(() => {
+    const els: HTMLAudioElement[] = [];
+    const fallback: { ctx: AudioContext | null } = { ctx: null };
+    const mount = (a: HTMLAudioElement) => {
+      a.hidden = true;
+      document.body.appendChild(a); // attached to the page, which some browsers expect for media controls
+      els.push(a);
+      anchorRef.current = a;
+    };
+    const wav = new Audio(silentWavUrl());
+    wav.loop = true;
+    wav.addEventListener("error", () => {
+      dbg("media-key anchor failed to load:", wav.error?.code, wav.error?.message, "- using a stream-based one instead");
+      if (fallback.ctx) return;
+      const s = streamAnchor();
+      fallback.ctx = s.ctx;
+      anchorCtxRef.current = s.ctx;
+      mount(s.a);
+      if (voiceRef.current?.context.state === "running") startAnchor()?.catch(() => {});
+    });
+    mount(wav);
+    return () => {
+      for (const a of els) {
+        a.pause();
+        a.remove();
+      }
+      void fallback.ctx?.close();
+      anchorRef.current = null;
+      anchorCtxRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!("mediaSession" in navigator)) return;
+    const ms = navigator.mediaSession;
+    // Drop keyboard focus first: a media key counts as keyboard input, which would otherwise
+    // make the browser draw a focus ring around whichever button was last clicked.
+    const fromKeys = (fn: () => unknown) => () => {
+      (document.activeElement as HTMLElement | null)?.blur();
+      void fn();
+    };
+    const handlers: [MediaSessionAction, MediaSessionActionHandler][] = [
+      ["play", fromKeys(() => setPaused(false))],
+      ["pause", fromKeys(() => setPaused(true))],
+      ["previoustrack", fromKeys(() => go(nowIndex() - 1))],
+      ["nexttrack", fromKeys(() => go(nowIndex() + 1))],
+    ];
+    for (const [action, handler] of handlers) {
+      try {
+        ms.setActionHandler(action, handler);
+      } catch {
+        /* action not supported by this browser */
+      }
+    }
+    return () => {
+      for (const [action] of handlers) {
+        try {
+          ms.setActionHandler(action, null);
+        } catch {
+          /* ignore */
+        }
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    const a = anchorRef.current;
+    if (a) {
+      if (playing) startAnchor()?.catch((e) => dbg("media-key anchor was blocked:", why(e)));
+      else a.pause();
+    }
+    if ("mediaSession" in navigator) navigator.mediaSession.playbackState = playing ? "playing" : "paused";
+  }, [playing]);
+
+  useEffect(() => {
+    if (!("mediaSession" in navigator) || !nowPlaying) return;
+    navigator.mediaSession.metadata = new MediaMetadata({ title: title(nowPlaying), artist: "Crossfade Player" });
+  }, [nowPlaying]);
 
   // Apply the volume slider (smoothed to avoid zipper noise).
   useEffect(() => {
