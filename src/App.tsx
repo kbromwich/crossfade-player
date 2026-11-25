@@ -15,6 +15,9 @@ const fadeCurves = (level: number) => {
 };
 type Cfg = { loop: number; level: number; repeat: boolean };
 
+/** Per-track override of the global loop setting. No entry means "follow the global setting". */
+type Mode = "once" | "loop";
+
 /** A decoded track plus the range (in seconds) that is actually audible. */
 type Loaded = { buf: AudioBuffer; lo: number; hi: number };
 
@@ -225,8 +228,8 @@ const volGain = (v: number) => (v / 100) ** 2; // squared so the slider feels ev
 const fill = (v: number, lo: number, hi: number) =>
   ({ "--p": `${((v - lo) / (hi - lo || 1)) * 100}%` }) as CSSProperties;
 
-const Icon = ({ d }: { d: string }) => (
-  <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true">
+const Icon = ({ d, size = 20 }: { d: string; size?: number }) => (
+  <svg viewBox="0 0 24 24" width={size} height={size} fill="currentColor" aria-hidden="true">
     <path d={d} />
   </svg>
 );
@@ -234,6 +237,8 @@ const PREV = "M6 6h2v12H6zM20 6v12L9.5 12z";
 const NEXT = "M16 6h2v12h-2zM4 6v12l10.5-6z";
 const PLAY = "M8 5v14l11-7z";
 const PAUSE = "M6 5h4v14H6zM14 5h4v14h-4z";
+const LOOP = "M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4z"; // two arrows chasing each other
+const ONCE = "M3 11h11v2H3zM14 8l4 4-4 4zM20 6h2v12h-2z"; // arrow running into an end stop
 const REPEAT = "M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4zm-4-2V9h-1l-2 1v1h1.5v4H13z";
 
 const css = `
@@ -268,6 +273,15 @@ body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,sans-
 .seg button[aria-pressed=true]{background:var(--accent);color:var(--on-accent)}
 .list{list-style:none;margin:0;padding:0;max-height:calc(100vh - 130px);overflow-y:auto}
 @media (max-width:760px){.layout{grid-template-columns:minmax(0,1fr);gap:16px}.list{max-height:none}}
+.row{display:flex;align-items:center;border-radius:0 6px 6px 0}
+.row.dragging{opacity:.4}
+.row[data-drop=before]{box-shadow:inset 0 2px 0 var(--accent)}
+.row[data-drop=after]{box-shadow:inset 0 -2px 0 var(--accent)}
+.row .item{flex:1;min-width:0;width:auto}
+.grip{cursor:grab;padding:0 6px;color:var(--muted);user-select:none;font-size:14px;line-height:1}
+.mode{flex:none;display:grid;place-items:center;width:28px;height:28px;margin:0 6px;padding:0;border:1px solid transparent;border-radius:6px;background:none;color:var(--muted);cursor:pointer}
+.mode:hover{border-color:var(--line)}
+.mode[data-mode=once],.mode[data-mode=loop]{color:var(--on-accent);background:var(--accent);border-color:var(--accent)}
 .item{display:block;width:100%;box-sizing:border-box;padding:9px 12px;border:0;border-left:3px solid transparent;border-radius:0 6px 6px 0;background:none;color:var(--muted);font:inherit;text-align:left;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .item:hover{background:var(--surface)}
 .item[aria-current=true]{color:var(--text);font-weight:600;border-left-color:var(--accent);background:var(--surface)}
@@ -386,6 +400,8 @@ export default function App() {
   const [repeat, setRepeat] = useStored<boolean>("repeat", true);
   const [silence, setSilence] = useStored<number>("silence", -54, [-90, -20]);
   const [alpha, setAlpha] = useStored<boolean>("alphaSort", true);
+  const [modes, setModes] = useState<Map<File, Mode>>(() => new Map());
+  const [drag, setDrag] = useState<{ from: File; over: File | null; after: boolean } | null>(null);
   const [pos, setPos] = useState(0);
   const [dur, setDur] = useState(0);
   const [scrub, setScrub] = useState<number | null>(null);
@@ -412,6 +428,13 @@ export default function App() {
   volumeRef.current = volume;
   const repeatRef = useRef(repeat);
   repeatRef.current = repeat;
+  const modesRef = useRef(modes);
+  modesRef.current = modes;
+  // Whether a given track loops: its own setting if it has one, otherwise the global toggle.
+  const repeatFor = (f: File) => {
+    const m = modesRef.current.get(f);
+    return m === undefined ? repeatRef.current : m === "loop";
+  };
   const silenceRef = useRef(silence);
   silenceRef.current = silence;
   const alphaRef = useRef(alpha);
@@ -517,7 +540,7 @@ export default function App() {
       const voice = new Voice(
         ctx,
         track,
-        () => ({ loop: loopFadeRef.current, level: crossRef.current / 100, repeat: repeatRef.current }),
+        () => ({ loop: loopFadeRef.current, level: crossRef.current / 100, repeat: repeatFor(list[i]) }),
         outRef.current!,
         old ? Math.max(f, 0.03) : 0.3
       );
@@ -615,6 +638,28 @@ export default function App() {
     applyOrder(alphabetical, tracksRef.current[indexRef.current]);
   };
 
+  // Move `file` next to `target` in the custom order (only used in Custom mode).
+  const moveTrack = (file: File, target: File, after: boolean) => {
+    if (file === target) return;
+    const list = addedRef.current.filter((f) => f !== file);
+    const at = list.indexOf(target);
+    if (at < 0) return;
+    list.splice(after ? at + 1 : at, 0, file);
+    addedRef.current = list;
+    applyOrder(false, tracksRef.current[indexRef.current]);
+  };
+
+  // Cycle a track's loop setting: follow global -> always once -> always loop -> follow global.
+  const cycleMode = (f: File) =>
+    setModes((prev) => {
+      const next = new Map(prev);
+      const cur = prev.get(f);
+      if (cur === undefined) next.set(f, "once");
+      else if (cur === "once") next.set(f, "loop");
+      else next.delete(f);
+      return next;
+    });
+
   // Drop files anywhere on the page.
   useEffect(() => {
     let depth = 0;
@@ -652,7 +697,8 @@ export default function App() {
       setDur(v ? v.duration : 0);
 
       // With looping off, crossfade into the next track as this one nears its end.
-      if (v && !repeatRef.current && !advancing.current && !loadingRef.current && v.context.state === "running") {
+      const cur = nowRef.current;
+      if (v && cur && !repeatFor(cur) && !advancing.current && !loadingRef.current && v.context.state === "running") {
         const done = v.isDone(); // fallback if the poll missed the end (e.g. throttled tab)
         const left = done ? 0 : v.duration - v.position();
         // Never fade for longer than half the track; keep a small lead even at 0 so the hand-off is seamless.
@@ -808,7 +854,8 @@ export default function App() {
             <button className="btn" aria-label="Next track" onClick={() => go(index + 1)} disabled={!tracks.length}>
               <Icon d={NEXT} />
             </button>
-            <button className="btn toggle" aria-label="Loop track" aria-pressed={repeat} title="Loop track"
+            <button className="btn toggle" aria-label="Loop tracks by default" aria-pressed={repeat}
+              title="Loop tracks until you skip (individual tracks can override this in the playlist)"
               onClick={() => setRepeat(!repeat)}>
               <Icon d={REPEAT} />
             </button>
@@ -858,19 +905,70 @@ export default function App() {
             <span>Playlist order</span>
             <div className="seg">
               <button aria-pressed={alpha} onClick={() => toggleSort(true)}>A–Z</button>
-              <button aria-pressed={!alpha} onClick={() => toggleSort(false)}>Added</button>
+              <button aria-pressed={!alpha} onClick={() => toggleSort(false)}>Custom</button>
             </div>
           </div>
         )}
         <ol className="list">
-          {tracks.map((f, i) => (
-            <li key={idOf(f)}>
-              <button className="item" aria-current={f === shownTrack} onClick={() => go(i)}>
-                {title(f)}
-                {busy && i === index && f !== shownTrack ? " …" : ""}
-              </button>
-            </li>
-          ))}
+          {tracks.map((f, i) => {
+            const mode = modes.get(f);
+            const dropMark =
+              drag && drag.over === f && drag.from !== f ? (drag.after ? "after" : "before") : undefined;
+            const modeHelp =
+              mode === undefined
+                ? `Follows the global loop setting (currently ${repeat ? "loop" : "play once"}). Click to force play once.`
+                : mode === "once"
+                  ? "Always plays once. Click to force looping."
+                  : "Always loops. Click to follow the global setting.";
+            return (
+              <li
+                key={idOf(f)}
+                className={`row${drag?.from === f ? " dragging" : ""}`}
+                data-drop={dropMark}
+                onDragOver={(e) => {
+                  if (!drag) return; // ignore file drags from outside the page
+                  e.preventDefault();
+                  const r = e.currentTarget.getBoundingClientRect();
+                  const after = e.clientY > r.top + r.height / 2;
+                  if (drag.over !== f || drag.after !== after) setDrag({ ...drag, over: f, after });
+                }}
+                onDrop={(e) => {
+                  if (!drag) return;
+                  e.preventDefault();
+                  e.stopPropagation();
+                  moveTrack(drag.from, f, drag.after);
+                  setDrag(null);
+                }}
+              >
+                {!alpha && (
+                  <span
+                    className="grip"
+                    draggable
+                    title="Drag to reorder"
+                    aria-hidden="true"
+                    onDragStart={(e) => {
+                      e.dataTransfer.effectAllowed = "move";
+                      e.dataTransfer.setData("text/plain", title(f)); // Firefox needs data to start a drag
+                      const row = e.currentTarget.closest("li");
+                      if (row) e.dataTransfer.setDragImage(row, 16, 16);
+                      setDrag({ from: f, over: null, after: false });
+                    }}
+                    onDragEnd={() => setDrag(null)}
+                  >
+                    ⋮⋮
+                  </span>
+                )}
+                <button className="item" aria-current={f === shownTrack} onClick={() => go(i)}>
+                  {title(f)}
+                  {busy && i === index && f !== shownTrack ? " …" : ""}
+                </button>
+                <button className="mode" data-mode={mode ?? "auto"} title={modeHelp} aria-label={modeHelp}
+                  onClick={() => cycleMode(f)}>
+                  <Icon d={(mode === undefined ? repeat : mode === "loop") ? LOOP : ONCE} size={16} />
+                </button>
+              </li>
+            );
+          })}
         </ol>
         </div>
        </div>
