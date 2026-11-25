@@ -13,7 +13,7 @@ const fadeCurves = (level: number) => {
   const p = Math.log(level) / Math.log(0.5);
   return { inn: curve((x) => Math.pow(x, p)), out: curve((x) => Math.pow(1 - x, p)) };
 };
-type Cfg = { loop: number; level: number; repeat: boolean };
+type Cfg = { loop: number; level: number; repeat: boolean; trackVolume: number };
 
 /** Per-track override of the global loop setting. No entry means "follow the global setting". */
 type Mode = "once" | "loop";
@@ -59,6 +59,7 @@ class Voice {
   private finished = false; // no more passes scheduled (looping off)
   private started = false; // a pass has been scheduled since the last (re)start
   private fader: GainNode; // used only for the fade-out
+  private trim: GainNode; // this track's own volume multiplier
   private layers: Layer[] = [];
   private live = new Map<AudioBufferSourceNode, GainNode>();
 
@@ -75,8 +76,11 @@ class Voice {
     this.duration = track.hi - track.lo; // audible length only
     this.master = ctx.createGain();
     this.fader = ctx.createGain();
+    this.trim = ctx.createGain();
+    this.trim.gain.value = this.cfg().trackVolume;
     this.master.connect(this.fader);
-    this.fader.connect(out);
+    this.fader.connect(this.trim);
+    this.trim.connect(out);
     const t = ctx.currentTime + 0.05;
     if (fadeIn > 0.01) {
       this.master.gain.value = 0;
@@ -131,6 +135,11 @@ class Voice {
     this.nextIn = L;
     this.started = true;
     if (!repeat) this.finished = true;
+  }
+
+  /** Change this track's volume multiplier (1 = unchanged), smoothed to avoid clicks. */
+  setVolume(v: number) {
+    this.trim.gain.setTargetAtTime(v, this.ctx.currentTime, 0.02);
   }
 
   get context() {
@@ -199,6 +208,7 @@ class Voice {
     }
     this.master.disconnect();
     this.fader.disconnect();
+    this.trim.disconnect();
   }
 }
 
@@ -219,6 +229,24 @@ const sig = (f: File) => `${f.name}|${f.size}|${f.lastModified}`;
 const dbg = (...a: unknown[]) => console.log("[player]", ...a); // diagnostics for track switching
 const why = (e: unknown) =>
   e instanceof Error ? (e.name === "Error" ? e.message : `${e.name}: ${e.message}`) : String(e);
+const DEFAULT_TRACK_VOL = 70; // percent; leaves headroom to raise a quiet track
+const VOL_KEY = "crossfade-player:trackVolumesV2"; // V2: scale is now 0-100 with a default of 70
+// Per-track volume multipliers (percent), remembered by file name + size + modified date.
+const loadVolumes = (): Record<string, number> => {
+  const out: Record<string, number> = {};
+  try {
+    const raw = localStorage.getItem(VOL_KEY);
+    const o: unknown = raw ? JSON.parse(raw) : null;
+    if (o && typeof o === "object") {
+      for (const [k, v] of Object.entries(o)) {
+        if (typeof v === "number" && Number.isFinite(v)) out[k] = Math.min(100, Math.max(0, v));
+      }
+    }
+  } catch {
+    /* storage unavailable or corrupt: start fresh */
+  }
+  return out;
+};
 const title = (f: File) => f.name.replace(/\.[^.]+$/, "");
 const fmt = (s: number) => {
   const r = Math.floor(s % 60);
@@ -238,6 +266,8 @@ const NEXT = "M16 6h2v12h-2zM4 6v12l10.5-6z";
 const PLAY = "M8 5v14l11-7z";
 const PAUSE = "M6 5h4v14H6zM14 5h4v14h-4z";
 const LOOP = "M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4z"; // two arrows chasing each other
+const VOL_UP = "M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z";
+const VOL_MUTE = "M7 9v6h4l5 5V4l-5 5H7z";
 const ONCE = "M3 11h11v2H3zM14 8l4 4-4 4zM20 6h2v12h-2z"; // arrow running into an end stop
 const REPEAT = "M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4zm-4-2V9h-1l-2 1v1h1.5v4H13z";
 
@@ -273,7 +303,7 @@ body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,sans-
 .seg button[aria-pressed=true]{background:var(--accent);color:var(--on-accent)}
 .list{list-style:none;margin:0;padding:0;max-height:calc(100vh - 130px);overflow-y:auto}
 @media (max-width:760px){.layout{grid-template-columns:minmax(0,1fr);gap:16px}.list{max-height:none}}
-.row{display:flex;align-items:center;border-radius:0 6px 6px 0}
+.row{display:flex;flex-wrap:wrap;align-items:center;border-radius:0 6px 6px 0}
 .row.dragging{opacity:.4}
 .row[data-drop=before]{box-shadow:inset 0 2px 0 var(--accent)}
 .row[data-drop=after]{box-shadow:inset 0 -2px 0 var(--accent)}
@@ -281,6 +311,12 @@ body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,sans-
 .grip{cursor:grab;padding:0 6px;color:var(--muted);user-select:none;font-size:14px;line-height:1}
 .mode{flex:none;display:grid;place-items:center;width:28px;height:28px;margin:0 6px;padding:0;border:1px solid transparent;border-radius:6px;background:none;color:var(--muted);cursor:pointer}
 .mode:hover{border-color:var(--line)}
+.mode[data-changed=true]{color:var(--on-accent);background:var(--accent);border-color:var(--accent)}
+.volpanel{flex-basis:100%;display:flex;align-items:center;gap:10px;padding:2px 12px 8px 33px;color:var(--muted);font-size:13px}
+.volpanel input{flex:1}
+.volval{min-width:40px;text-align:right;font-variant-numeric:tabular-nums}
+.volreset{border:1px solid var(--line);background:none;color:var(--muted);font:inherit;font-size:12px;border-radius:6px;padding:2px 8px;cursor:pointer}
+.volreset:disabled{opacity:.4;cursor:default}
 .mode[data-mode=once],.mode[data-mode=loop]{color:var(--on-accent);background:var(--accent);border-color:var(--accent)}
 .item{display:block;width:100%;box-sizing:border-box;padding:9px 12px;border:0;border-left:3px solid transparent;border-radius:0 6px 6px 0;background:none;color:var(--muted);font:inherit;text-align:left;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .item:hover{background:var(--surface)}
@@ -402,6 +438,8 @@ export default function App() {
   const [alpha, setAlpha] = useStored<boolean>("alphaSort", true);
   const [modes, setModes] = useState<Map<File, Mode>>(() => new Map());
   const [drag, setDrag] = useState<{ from: File; over: File | null; after: boolean } | null>(null);
+  const [volumes, setVolumes] = useState<Record<string, number>>(loadVolumes);
+  const [volOpen, setVolOpen] = useState<File | null>(null); // track whose volume slider is expanded
   const [pos, setPos] = useState(0);
   const [dur, setDur] = useState(0);
   const [scrub, setScrub] = useState<number | null>(null);
@@ -431,6 +469,10 @@ export default function App() {
   const modesRef = useRef(modes);
   modesRef.current = modes;
   // Whether a given track loops: its own setting if it has one, otherwise the global toggle.
+  const volumesRef = useRef(volumes);
+  volumesRef.current = volumes;
+  // Same curve as the master slider, so the two combine as expected (70% x 70% sounds like ~49%).
+  const volFor = (f: File) => volGain(volumesRef.current[sig(f)] ?? DEFAULT_TRACK_VOL);
   const repeatFor = (f: File) => {
     const m = modesRef.current.get(f);
     return m === undefined ? repeatRef.current : m === "loop";
@@ -540,7 +582,7 @@ export default function App() {
       const voice = new Voice(
         ctx,
         track,
-        () => ({ loop: loopFadeRef.current, level: crossRef.current / 100, repeat: repeatFor(list[i]) }),
+        () => ({ loop: loopFadeRef.current, level: crossRef.current / 100, repeat: repeatFor(list[i]), trackVolume: volFor(list[i]) }),
         outRef.current!,
         old ? Math.max(f, 0.03) : 0.3
       );
@@ -647,6 +689,16 @@ export default function App() {
     list.splice(after ? at + 1 : at, 0, file);
     addedRef.current = list;
     applyOrder(false, tracksRef.current[indexRef.current]);
+  };
+
+  const setTrackVolume = (f: File, pct: number) => {
+    setVolumes((prev) => {
+      const next = { ...prev };
+      if (pct === DEFAULT_TRACK_VOL) delete next[sig(f)];
+      else next[sig(f)] = pct;
+      return next;
+    });
+    if (f === nowRef.current) voiceRef.current?.setVolume(volGain(pct)); // takes effect immediately
   };
 
   // Cycle a track's loop setting: follow global -> always once -> always loop -> follow global.
@@ -796,6 +848,23 @@ export default function App() {
     navigator.mediaSession.metadata = new MediaMetadata({ title: title(nowPlaying), artist: "Crossfade Player" });
   }, [nowPlaying]);
 
+  // Remember per-track volumes; Escape closes an open volume slider.
+  useEffect(() => {
+    try {
+      localStorage.setItem(VOL_KEY, JSON.stringify(volumes));
+    } catch {
+      /* storage full or blocked */
+    }
+  }, [volumes]);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setVolOpen(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
   // Apply the volume slider (smoothed to avoid zipper noise).
   useEffect(() => {
     const ctx = ctxRef.current;
@@ -912,6 +981,8 @@ export default function App() {
         <ol className="list">
           {tracks.map((f, i) => {
             const mode = modes.get(f);
+            const pct = volumes[sig(f)] ?? DEFAULT_TRACK_VOL;
+            const volHelp = `Track volume: ${pct}%${pct === DEFAULT_TRACK_VOL ? " (default)" : ""}. Click to adjust.`;
             const dropMark =
               drag && drag.over === f && drag.from !== f ? (drag.after ? "after" : "before") : undefined;
             const modeHelp =
@@ -962,10 +1033,25 @@ export default function App() {
                   {title(f)}
                   {busy && i === index && f !== shownTrack ? " …" : ""}
                 </button>
+                <button className="mode" data-changed={pct !== DEFAULT_TRACK_VOL} title={volHelp} aria-label={volHelp}
+                  aria-expanded={volOpen === f} onClick={() => setVolOpen(volOpen === f ? null : f)}>
+                  <Icon d={pct === 0 ? VOL_MUTE : VOL_UP} size={16} />
+                </button>
                 <button className="mode" data-mode={mode ?? "auto"} title={modeHelp} aria-label={modeHelp}
                   onClick={() => cycleMode(f)}>
                   <Icon d={(mode === undefined ? repeat : mode === "loop") ? LOOP : ONCE} size={16} />
                 </button>
+                {volOpen === f && (
+                  <div className="volpanel">
+                    <input type="range" aria-label={`Volume for ${title(f)}`} min={0} max={100} step={5}
+                      value={pct} style={fill(pct, 0, 100)}
+                      onChange={(e) => setTrackVolume(f, +e.target.value)} />
+                    <span className="volval">{pct}%</span>
+                    <button className="volreset" disabled={pct === DEFAULT_TRACK_VOL} onClick={() => setTrackVolume(f, DEFAULT_TRACK_VOL)}>
+                      Reset
+                    </button>
+                  </div>
+                )}
               </li>
             );
           })}
